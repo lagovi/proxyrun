@@ -8,7 +8,6 @@ APPS_FILE="$CONF_DIR/apps.txt"
 
 mkdir -p "$CONF_DIR"
 
-# Инициализация дефолтных профилей
 if [ ! -f "$PROFILES_FILE" ]; then
     cat << 'INIT_EOF' > "$PROFILES_FILE"
 home-http	http://192.168.1.55:18080	Home HTTP Proxy
@@ -42,7 +41,6 @@ get_profile_desc() {
     awk -F'\t' -v target="$id" '$1 == target {print $3}' "$PROFILES_FILE"
 }
 
-# Опрос geo/ISP данных через ipinfo.io
 fetch_geo_info() {
     local url="$1"
     local raw_json=""
@@ -75,7 +73,6 @@ except Exception:
 ' "$raw_json"
 }
 
-# Добавление профиля
 add_profile() {
     echo ""
     local id desc proto addr url
@@ -92,7 +89,6 @@ add_profile() {
     desc=$(gum input --placeholder "например: Canadian Proton SOCKS5" --prompt "Описание: ")
     [ -z "$desc" ] && desc="$id"
 
-    # Выбор протокола через интерактивное меню
     proto=$(gum choose --header "Выберите тип протокола:" "SOCKS5" "HTTP")
     [ -z "$proto" ] && return 0
 
@@ -103,10 +99,8 @@ add_profile() {
     addr=$(echo "$addr" | xargs)
     [ -z "$addr" ] && return 0
 
-    # Если пользователь случайно вставил префикс протокола — отрезаем его
     addr=$(echo "$addr" | sed -E 's|^[a-zA-Z0-9+.-]+://||')
 
-    # Формируем правильный системный URL (socks5h для удалённого резолва DNS без утечек)
     if [ "$proto" = "SOCKS5" ]; then
         url="socks5h://$addr"
     else
@@ -122,7 +116,6 @@ add_profile() {
     fi
 }
 
-# Редактирование профиля
 edit_profile() {
     mapfile -t ids < <(awk -F'\t' '$1 != "direct" {print $1}' "$PROFILES_FILE")
     if [ ${#ids[@]} -eq 0 ]; then
@@ -140,7 +133,6 @@ edit_profile() {
     cur_url=$(get_profile_url "$target")
     cur_desc=$(get_profile_desc "$target")
 
-    # Определяем текущий протокол и чистый host:port
     cur_addr=$(echo "$cur_url" | sed -E 's|^[a-zA-Z0-9+.-]+://||')
     local proto_opts=()
     if [[ "$cur_url" =~ ^socks ]]; then
@@ -179,12 +171,10 @@ edit_profile() {
         new_url="http://$new_addr"
     fi
 
-    # Обновляем profiles.tsv
     grep -v "^$target"$'\t' "$PROFILES_FILE" > "$PROFILES_FILE.tmp" || true
     echo -e "${new_id}\t${new_url}\t${new_desc}" >> "$PROFILES_FILE.tmp"
     mv "$PROFILES_FILE.tmp" "$PROFILES_FILE"
 
-    # Если профиль был дефолтным — обновляем имя
     local def_id
     def_id=$(get_default_id)
     if [ "$def_id" = "$target" ]; then
@@ -196,7 +186,6 @@ edit_profile() {
     sleep 1
 }
 
-# Удаление профиля
 delete_profile() {
     local default_id
     default_id=$(get_default_id)
@@ -225,7 +214,62 @@ delete_profile() {
     fi
 }
 
-# Кэш проверки
+# Режим быстрого выбора перед запуском приложения
+select_and_run() {
+    local cmd=("$@")
+    if [ ${#cmd[@]} -eq 0 ]; then
+        echo "Ошибка: не указана команда для запуска." >&2
+        exit 1
+    fi
+
+    local def_id
+    def_id=$(get_default_id)
+
+    # Дефолтный профиль ставим САМЫМ ПЕРВЫМ, чтобы Enter сразу запускал его
+    local menu_items=()
+    local def_url def_desc
+    def_url=$(get_profile_url "$def_id")
+    def_desc=$(get_profile_desc "$def_id")
+
+    menu_items+=("● $def_id — $def_desc ($def_url) [Enter: Старт]")
+
+    while IFS=$'\t' read -r id url desc; do
+        [ -z "$id" ] && continue
+        [ "$id" = "$def_id" ] && continue
+        menu_items+=("○ $id — $desc ($url)")
+    done < "$PROFILES_FILE"
+
+    menu_items+=(
+        "────────────────────────────────────────"
+        "⚙️  Настройки ProxyRun (добавить/изменить)"
+        "✕ Отмена"
+    )
+
+    local choice
+    choice=$(gum choose --header "Запуск [${cmd[*]}] через прокси:" "${menu_items[@]}")
+
+    case "$choice" in
+        "✕ Отмена"|"")
+            clear
+            exit 0
+            ;;
+        "────────────────────────────────────────")
+            clear
+            exit 0
+            ;;
+        "⚙️  Настройки ProxyRun (добавить/изменить)")
+            tui_menu
+            exit 0
+            ;;
+        *)
+            local selected_id
+            selected_id=$(echo "$choice" | sed -E 's/^[●○] ([^ —]+).*/\1/')
+            clear
+            exec proxyrun -p "$selected_id" "${cmd[@]}"
+            ;;
+    esac
+}
+
 CACHED_FOR_ID=""
 CACHED_IP=""
 CACHED_LOC=""
@@ -250,7 +294,6 @@ check_current_proxy_status() {
     fi
 }
 
-# TUI Меню
 tui_menu() {
     if ! command -v gum >/dev/null 2>&1; then
         echo "Ошибка: утилита gum не найдена. Установите: sudo pacman -S gum"
@@ -357,13 +400,18 @@ tui_menu() {
     done
 }
 
-# Обработка параметров CLI
+# Обработка CLI параметров
 SELECTED_PROFILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -m|--menu|--config)
             tui_menu
+            exit 0
+            ;;
+        -s|--select)
+            shift
+            select_and_run "$@"
             exit 0
             ;;
         -d|--direct)
@@ -379,9 +427,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Использование:"
             echo "  proxyrun <команда> [аргументы...]      Запуск через дефолтный прокси"
+            echo "  proxyrun -s <команда> [аргументы...]   Быстрый выбор прокси перед запуском команды"
             echo "  proxyrun -p <профиль> <команда>        Запуск через конкретный профиль"
             echo "  proxyrun -d <команда>                  Запуск напрямую (без прокси)"
-            echo "  proxyrun (без аргументов)              Открыть интерактивное TUI-меню"
+            echo "  proxyrun (без аргументов)              Открыть главное TUI-меню с проверкой сети"
             exit 0
             ;;
         *)
