@@ -8,7 +8,7 @@ APPS_FILE="$CONF_DIR/apps.txt"
 
 mkdir -p "$CONF_DIR"
 
-# 1. Начальная инициализация профилей, если файлов конфигурации нет
+# Инициализация дефолтных профилей
 if [ ! -f "$PROFILES_FILE" ]; then
     cat << 'INIT_EOF' > "$PROFILES_FILE"
 home-http	http://192.168.1.55:18080	Home HTTP Proxy
@@ -28,7 +28,6 @@ bash
 INIT_EOF
 fi
 
-# Вспомогательные функции
 get_default_id() {
     cat "$DEFAULT_FILE" 2>/dev/null || echo "direct"
 }
@@ -43,43 +42,44 @@ get_profile_desc() {
     awk -F'\t' -v target="$id" '$1 == target {print $3}' "$PROFILES_FILE"
 }
 
-# Тестирование прокси
-test_connection() {
+# Опрос geo/ISP данных через ipinfo.io
+fetch_geo_info() {
     local url="$1"
-    local desc="$2"
-    echo ""
-    if [ "$url" = "DIRECT" ] || [ -z "$url" ]; then
-        echo "Тестирование прямого подключения..."
-        local ip
-        ip=$(curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "FAIL")
-        if [ "$ip" != "FAIL" ]; then
-            gum style --foreground 2 "✓ Прямое подключение работает. Внешний IP: $ip"
-        else
-            gum style --foreground 1 "✗ Нет доступа к сети!"
-        fi
-    else
-        echo "Проверка [$desc] -> $url ..."
-        local start_t end_t elapsed ip
-        start_t=$(date +%s%3N)
-        ip=$(curl -s -m 6 -x "$url" https://api.ipify.org 2>/dev/null || echo "FAIL")
-        end_t=$(date +%s%3N)
-        elapsed=$((end_t - start_t))
+    local raw_json=""
+    local curl_cmd=(curl -s -m 4)
 
-        if [ "$ip" != "FAIL" ]; then
-            gum style --foreground 2 "✓ Прокси активен! Exit IP: $ip (${elapsed} ms)"
-        else
-            gum style --foreground 1 "✗ Ошибка подключения к $url (таймаут или неверный протокол)!"
-        fi
+    if [ "$url" != "DIRECT" ] && [ -n "$url" ]; then
+        curl_cmd+=(-x "$url")
     fi
-    echo ""
-    read -rp "Нажмите Enter для возврата..." _
+    curl_cmd+=(https://ipinfo.io)
+
+    raw_json=$("${curl_cmd[@]}" 2>/dev/null || true)
+
+    if [ -z "$raw_json" ]; then
+        echo "FAIL||"
+        return 0
+    fi
+
+    python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    ip = d.get("ip", "N/A")
+    city = d.get("city", "")
+    country = d.get("country", "")
+    loc = f"{city}, {country}".strip(", ")
+    org = d.get("org", "N/A")
+    print(f"{ip}|{loc}|{org}")
+except Exception:
+    print("FAIL||")
+' "$raw_json"
 }
 
 # Добавление профиля
 add_profile() {
     echo ""
-    local id desc url
-    id=$(gum input --placeholder "например: vps-us, work-corp" --prompt "ID профиля (без пробелов): ")
+    local id desc proto addr url
+    id=$(gum input --placeholder "например: ca-proton, work-vps" --prompt "ID профиля (без пробелов): ")
     id=$(echo "$id" | tr -d '[:space:]')
     [ -z "$id" ] && return 0
 
@@ -89,24 +89,111 @@ add_profile() {
         return 0
     fi
 
-    desc=$(gum input --placeholder "например: Fast US SOCKS5" --prompt "Описание: ")
+    desc=$(gum input --placeholder "например: Canadian Proton SOCKS5" --prompt "Описание: ")
     [ -z "$desc" ] && desc="$id"
 
-    url=$(gum input --placeholder "192.168.1.55:18080 или socks5h://..." --prompt "URL прокси: ")
-    url=$(echo "$url" | xargs)
-    [ -z "$url" ] && return 0
+    # Выбор протокола через интерактивное меню
+    proto=$(gum choose --header "Выберите тип протокола:" "SOCKS5" "HTTP")
+    [ -z "$proto" ] && return 0
 
-    # Автодополнение протокола
-    if [[ ! "$url" =~ :// ]]; then
-        url="http://$url"
+    local placeholder="127.0.0.1:10809"
+    [ "$proto" = "HTTP" ] && placeholder="192.168.1.55:18080"
+
+    addr=$(gum input --placeholder "$placeholder" --prompt "Адрес и порт (host:port): ")
+    addr=$(echo "$addr" | xargs)
+    [ -z "$addr" ] && return 0
+
+    # Если пользователь случайно вставил префикс протокола — отрезаем его
+    addr=$(echo "$addr" | sed -E 's|^[a-zA-Z0-9+.-]+://||')
+
+    # Формируем правильный системный URL (socks5h для удалённого резолва DNS без утечек)
+    if [ "$proto" = "SOCKS5" ]; then
+        url="socks5h://$addr"
+    else
+        url="http://$addr"
     fi
 
     echo -e "${id}\t${url}\t${desc}" >> "$PROFILES_FILE"
-    gum style --foreground 2 "Профиль [$id] успешно сохранён!"
+    gum style --foreground 2 "✓ Профиль [$id] успешно сохранён ($url)!"
 
     if gum confirm "Сделать его профилем по умолчанию?"; then
         echo "$id" > "$DEFAULT_FILE"
+        CACHED_FOR_ID=""
     fi
+}
+
+# Редактирование профиля
+edit_profile() {
+    mapfile -t ids < <(awk -F'\t' '$1 != "direct" {print $1}' "$PROFILES_FILE")
+    if [ ${#ids[@]} -eq 0 ]; then
+        gum style --foreground 3 "Нет пользовательских профилей для редактирования."
+        sleep 1.5
+        return 0
+    fi
+
+    echo ""
+    local target
+    target=$(gum choose --header "Выберите профиль для редактирования:" "${ids[@]}" "« Отмена")
+    [ "$target" = "« Отмена" ] || [ -z "$target" ] && return 0
+
+    local cur_url cur_desc cur_proto cur_addr
+    cur_url=$(get_profile_url "$target")
+    cur_desc=$(get_profile_desc "$target")
+
+    # Определяем текущий протокол и чистый host:port
+    cur_addr=$(echo "$cur_url" | sed -E 's|^[a-zA-Z0-9+.-]+://||')
+    local proto_opts=()
+    if [[ "$cur_url" =~ ^socks ]]; then
+        proto_opts=("SOCKS5" "HTTP")
+    else
+        proto_opts=("HTTP" "SOCKS5")
+    fi
+
+    echo ""
+    gum style --bold "Редактирование профиля [$target]:"
+
+    local new_id new_desc new_proto new_addr new_url
+    new_id=$(gum input --value "$target" --prompt "ID профиля: ")
+    new_id=$(echo "$new_id" | tr -d '[:space:]')
+    [ -z "$new_id" ] && new_id="$target"
+
+    if [ "$new_id" != "$target" ] && grep -q "^$new_id"$'\t' "$PROFILES_FILE" 2>/dev/null; then
+        gum style --foreground 1 "Профиль с ID [$new_id] уже существует!"
+        sleep 1.5
+        return 0
+    fi
+
+    new_desc=$(gum input --value "$cur_desc" --prompt "Описание: ")
+    [ -z "$new_desc" ] && new_desc="$cur_desc"
+
+    new_proto=$(gum choose --header "Тип протокола (текущий: ${proto_opts[0]}):" "${proto_opts[@]}")
+    [ -z "$new_proto" ] && new_proto="${proto_opts[0]}"
+
+    new_addr=$(gum input --value "$cur_addr" --prompt "Адрес и порт (host:port): ")
+    new_addr=$(echo "$new_addr" | sed -E 's|^[a-zA-Z0-9+.-]+://||' | xargs)
+    [ -z "$new_addr" ] && new_addr="$cur_addr"
+
+    if [ "$new_proto" = "SOCKS5" ]; then
+        new_url="socks5h://$new_addr"
+    else
+        new_url="http://$new_addr"
+    fi
+
+    # Обновляем profiles.tsv
+    grep -v "^$target"$'\t' "$PROFILES_FILE" > "$PROFILES_FILE.tmp" || true
+    echo -e "${new_id}\t${new_url}\t${new_desc}" >> "$PROFILES_FILE.tmp"
+    mv "$PROFILES_FILE.tmp" "$PROFILES_FILE"
+
+    # Если профиль был дефолтным — обновляем имя
+    local def_id
+    def_id=$(get_default_id)
+    if [ "$def_id" = "$target" ]; then
+        echo "$new_id" > "$DEFAULT_FILE"
+    fi
+
+    CACHED_FOR_ID=""
+    gum style --foreground 2 "✓ Профиль успешно обновлён ($new_url)!"
+    sleep 1
 }
 
 # Удаление профиля
@@ -121,6 +208,7 @@ delete_profile() {
         return 0
     fi
 
+    echo ""
     local target
     target=$(gum choose --header "Выберите профиль для удаления:" "${ids[@]}" "« Отмена")
     [ "$target" = "« Отмена" ] || [ -z "$target" ] && return 0
@@ -131,8 +219,34 @@ delete_profile() {
             echo "direct" > "$DEFAULT_FILE"
             gum style --foreground 3 "Активный профиль сброшен на direct."
         fi
+        CACHED_FOR_ID=""
         gum style --foreground 2 "Профиль удалён."
         sleep 1
+    fi
+}
+
+# Кэш проверки
+CACHED_FOR_ID=""
+CACHED_IP=""
+CACHED_LOC=""
+CACHED_ORG=""
+CACHED_OK=0
+
+check_current_proxy_status() {
+    local def_id="$1"
+    local def_url="$2"
+
+    if [ "$CACHED_FOR_ID" != "$def_id" ]; then
+        local geo_data
+        geo_data=$(gum spin --spinner dot --title "Проверка соединения [$def_id]..." -- bash -c "$(declare -f fetch_geo_info); fetch_geo_info '$def_url'")
+        
+        IFS='|' read -r CACHED_IP CACHED_LOC CACHED_ORG <<< "$geo_data"
+        if [ "$CACHED_IP" = "FAIL" ] || [ -z "$CACHED_IP" ]; then
+            CACHED_OK=0
+        else
+            CACHED_OK=1
+        fi
+        CACHED_FOR_ID="$def_id"
     fi
 }
 
@@ -150,6 +264,8 @@ tui_menu() {
         def_url=$(get_profile_url "$def_id")
         def_desc=$(get_profile_desc "$def_id")
 
+        check_current_proxy_status "$def_id" "$def_url"
+
         gum style \
             --border double \
             --margin "0 1" \
@@ -158,7 +274,17 @@ tui_menu() {
             --bold \
             "ProxyRun: Universal Agent & CLI Proxy Manager"
 
-        echo -e " Дефолтный профиль: $(gum style --bold --foreground 6 "$def_id") ($(gum style --foreground 8 "$def_url"))"
+        echo -e " Профиль: $(gum style --bold --foreground 6 "$def_id") ($(gum style --foreground 8 "$def_url"))"
+
+        if [ "$CACHED_OK" -eq 1 ]; then
+            gum style --foreground 2 "  ● Подключение активно"
+            echo -e "  ├─ IP:        $(gum style --bold "$CACHED_IP")"
+            echo -e "  ├─ Локация:   $(gum style --bold "$CACHED_LOC")"
+            echo -e "  └─ Провайдер: $(gum style --foreground 3 "$CACHED_ORG")"
+        else
+            gum style --foreground 1 "  ✗ Ошибка подключения (прокси не отвечает или нет сети)"
+            echo "  └─ Проверьте адрес, порт и запущен ли демон прокси."
+        fi
         echo ""
 
         local menu_items=()
@@ -174,14 +300,15 @@ tui_menu() {
         menu_items+=(
             "────────────────────────────────────────"
             "🚀 Запустить приложение..."
-            "⚡ Проверить текущий прокси"
+            "🔄 Обновить статус подключения"
+            "✏️  Редактировать профиль"
             "➕ Добавить новый прокси"
             "🗑️  Удалить прокси"
             "✕ Выход"
         )
 
         local choice
-        choice=$(gum choose --header "Выберите действие или сделайте профиль активным:" "${menu_items[@]}")
+        choice=$(gum choose --header "Выберите действие или переключите профиль:" "${menu_items[@]}")
 
         case "$choice" in
             "────────────────────────────────────────"|"")
@@ -202,8 +329,11 @@ tui_menu() {
                 echo "Запуск [$app_choice] через прокси [$def_id] ($def_url)..."
                 exec proxyrun -p "$def_id" $app_choice
                 ;;
-            "⚡ Проверить текущий прокси")
-                test_connection "$def_url" "$def_desc"
+            "🔄 Обновить статус подключения")
+                CACHED_FOR_ID=""
+                ;;
+            "✏️  Редактировать профиль")
+                edit_profile
                 ;;
             "➕ Добавить новый прокси")
                 add_profile
@@ -218,7 +348,10 @@ tui_menu() {
             *)
                 local selected_id
                 selected_id=$(echo "$choice" | sed -E 's/^[●○] ([^ —]+).*/\1/')
-                echo "$selected_id" > "$DEFAULT_FILE"
+                if [ "$selected_id" != "$def_id" ]; then
+                    echo "$selected_id" > "$DEFAULT_FILE"
+                    CACHED_FOR_ID=""
+                fi
                 ;;
         esac
     done
@@ -257,13 +390,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Если вызвали без аргументов — открываем TUI
 if [ $# -eq 0 ] && [ -z "$SELECTED_PROFILE" ]; then
     tui_menu
     exit 0
 fi
 
-# Находим URL прокси
 if [ -z "$SELECTED_PROFILE" ]; then
     SELECTED_PROFILE=$(get_default_id)
 fi
@@ -275,7 +406,6 @@ if [ -z "$TARGET_URL" ]; then
     exit 1
 fi
 
-# Экспорт полного набора сетевых переменных
 if [ "$TARGET_URL" = "DIRECT" ]; then
     unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 else
