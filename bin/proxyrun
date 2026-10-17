@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+set -e
+
+CONF_DIR="$HOME/.config/proxyrun"
+PROFILES_FILE="$CONF_DIR/profiles.tsv"
+DEFAULT_FILE="$CONF_DIR/default"
+APPS_FILE="$CONF_DIR/apps.txt"
+
+mkdir -p "$CONF_DIR"
+
+# 1. Начальная инициализация профилей, если файлов конфигурации нет
+if [ ! -f "$PROFILES_FILE" ]; then
+    cat << 'INIT_EOF' > "$PROFILES_FILE"
+home-http	http://192.168.1.55:18080	Home HTTP Proxy
+home-socks	socks5h://192.168.1.55:10808	Home SOCKS5 Router
+direct	DIRECT	Direct connection (No proxy)
+INIT_EOF
+fi
+
+[ ! -f "$DEFAULT_FILE" ] && echo "home-http" > "$DEFAULT_FILE"
+
+if [ ! -f "$APPS_FILE" ]; then
+    cat << 'INIT_EOF' > "$APPS_FILE"
+opencode
+codex
+aider
+bash
+INIT_EOF
+fi
+
+# Вспомогательные функции
+get_default_id() {
+    cat "$DEFAULT_FILE" 2>/dev/null || echo "direct"
+}
+
+get_profile_url() {
+    local id="$1"
+    awk -F'\t' -v target="$id" '$1 == target {print $2}' "$PROFILES_FILE"
+}
+
+get_profile_desc() {
+    local id="$1"
+    awk -F'\t' -v target="$id" '$1 == target {print $3}' "$PROFILES_FILE"
+}
+
+# Тестирование прокси
+test_connection() {
+    local url="$1"
+    local desc="$2"
+    echo ""
+    if [ "$url" = "DIRECT" ] || [ -z "$url" ]; then
+        echo "Тестирование прямого подключения..."
+        local ip
+        ip=$(curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "FAIL")
+        if [ "$ip" != "FAIL" ]; then
+            gum style --foreground 2 "✓ Прямое подключение работает. Внешний IP: $ip"
+        else
+            gum style --foreground 1 "✗ Нет доступа к сети!"
+        fi
+    else
+        echo "Проверка [$desc] -> $url ..."
+        local start_t end_t elapsed ip
+        start_t=$(date +%s%3N)
+        ip=$(curl -s -m 6 -x "$url" https://api.ipify.org 2>/dev/null || echo "FAIL")
+        end_t=$(date +%s%3N)
+        elapsed=$((end_t - start_t))
+
+        if [ "$ip" != "FAIL" ]; then
+            gum style --foreground 2 "✓ Прокси активен! Exit IP: $ip (${elapsed} ms)"
+        else
+            gum style --foreground 1 "✗ Ошибка подключения к $url (таймаут или неверный протокол)!"
+        fi
+    fi
+    echo ""
+    read -rp "Нажмите Enter для возврата..." _
+}
+
+# Добавление профиля
+add_profile() {
+    echo ""
+    local id desc url
+    id=$(gum input --placeholder "например: vps-us, work-corp" --prompt "ID профиля (без пробелов): ")
+    id=$(echo "$id" | tr -d '[:space:]')
+    [ -z "$id" ] && return 0
+
+    if grep -q "^$id"$'\t' "$PROFILES_FILE" 2>/dev/null; then
+        gum style --foreground 1 "Профиль с таким ID уже существует!"
+        sleep 1.5
+        return 0
+    fi
+
+    desc=$(gum input --placeholder "например: Fast US SOCKS5" --prompt "Описание: ")
+    [ -z "$desc" ] && desc="$id"
+
+    url=$(gum input --placeholder "192.168.1.55:18080 или socks5h://..." --prompt "URL прокси: ")
+    url=$(echo "$url" | xargs)
+    [ -z "$url" ] && return 0
+
+    # Автодополнение протокола
+    if [[ ! "$url" =~ :// ]]; then
+        url="http://$url"
+    fi
+
+    echo -e "${id}\t${url}\t${desc}" >> "$PROFILES_FILE"
+    gum style --foreground 2 "Профиль [$id] успешно сохранён!"
+
+    if gum confirm "Сделать его профилем по умолчанию?"; then
+        echo "$id" > "$DEFAULT_FILE"
+    fi
+}
+
+# Удаление профиля
+delete_profile() {
+    local default_id
+    default_id=$(get_default_id)
+
+    mapfile -t ids < <(awk -F'\t' '$1 != "direct" {print $1}' "$PROFILES_FILE")
+    if [ ${#ids[@]} -eq 0 ]; then
+        gum style --foreground 3 "Нет пользовательских профилей для удаления."
+        sleep 1.5
+        return 0
+    fi
+
+    local target
+    target=$(gum choose --header "Выберите профиль для удаления:" "${ids[@]}" "« Отмена")
+    [ "$target" = "« Отмена" ] || [ -z "$target" ] && return 0
+
+    if gum confirm "Удалить профиль [$target]?"; then
+        grep -v "^$target"$'\t' "$PROFILES_FILE" > "$PROFILES_FILE.tmp" && mv "$PROFILES_FILE.tmp" "$PROFILES_FILE"
+        if [ "$default_id" = "$target" ]; then
+            echo "direct" > "$DEFAULT_FILE"
+            gum style --foreground 3 "Активный профиль сброшен на direct."
+        fi
+        gum style --foreground 2 "Профиль удалён."
+        sleep 1
+    fi
+}
+
+# TUI Меню
+tui_menu() {
+    if ! command -v gum >/dev/null 2>&1; then
+        echo "Ошибка: утилита gum не найдена. Установите: sudo pacman -S gum"
+        exit 1
+    fi
+
+    while true; do
+        clear
+        local def_id def_url def_desc
+        def_id=$(get_default_id)
+        def_url=$(get_profile_url "$def_id")
+        def_desc=$(get_profile_desc "$def_id")
+
+        gum style \
+            --border double \
+            --margin "0 1" \
+            --padding "0 2" \
+            --border-foreground 212 \
+            --bold \
+            "ProxyRun: Universal Agent & CLI Proxy Manager"
+
+        echo -e " Дефолтный профиль: $(gum style --bold --foreground 6 "$def_id") ($(gum style --foreground 8 "$def_url"))"
+        echo ""
+
+        local menu_items=()
+        while IFS=$'\t' read -r id url desc; do
+            [ -z "$id" ] && continue
+            if [ "$id" = "$def_id" ]; then
+                menu_items+=("● $id — $desc ($url)")
+            else
+                menu_items+=("○ $id — $desc ($url)")
+            fi
+        done < "$PROFILES_FILE"
+
+        menu_items+=(
+            "────────────────────────────────────────"
+            "🚀 Запустить приложение..."
+            "⚡ Проверить текущий прокси"
+            "➕ Добавить новый прокси"
+            "🗑️  Удалить прокси"
+            "✕ Выход"
+        )
+
+        local choice
+        choice=$(gum choose --header "Выберите действие или сделайте профиль активным:" "${menu_items[@]}")
+
+        case "$choice" in
+            "────────────────────────────────────────"|"")
+                continue
+                ;;
+            "🚀 Запустить приложение...")
+                mapfile -t apps < <(grep -v '^[[:space:]]*$' "$APPS_FILE" || true)
+                apps+=("⌨️  Ввести произвольную команду..." "« Назад")
+                local app_choice
+                app_choice=$(gum choose --header "Что запускаем через [$def_id]?" "${apps[@]}")
+                [ "$app_choice" = "« Назад" ] || [ -z "$app_choice" ] && continue
+
+                if [ "$app_choice" = "⌨️  Ввести произвольную команду..." ]; then
+                    app_choice=$(gum input --placeholder "например: curl ipinfo.io" --prompt "Команда: ")
+                    [ -z "$app_choice" ] && continue
+                fi
+                clear
+                echo "Запуск [$app_choice] через прокси [$def_id] ($def_url)..."
+                exec proxyrun -p "$def_id" $app_choice
+                ;;
+            "⚡ Проверить текущий прокси")
+                test_connection "$def_url" "$def_desc"
+                ;;
+            "➕ Добавить новый прокси")
+                add_profile
+                ;;
+            "🗑️  Удалить прокси")
+                delete_profile
+                ;;
+            "✕ Выход")
+                clear
+                exit 0
+                ;;
+            *)
+                local selected_id
+                selected_id=$(echo "$choice" | sed -E 's/^[●○] ([^ —]+).*/\1/')
+                echo "$selected_id" > "$DEFAULT_FILE"
+                ;;
+        esac
+    done
+}
+
+# Обработка параметров CLI
+SELECTED_PROFILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -m|--menu|--config)
+            tui_menu
+            exit 0
+            ;;
+        -d|--direct)
+            SELECTED_PROFILE="direct"
+            shift
+            break
+            ;;
+        -p|--profile)
+            SELECTED_PROFILE="$2"
+            shift 2
+            break
+            ;;
+        -h|--help)
+            echo "Использование:"
+            echo "  proxyrun <команда> [аргументы...]      Запуск через дефолтный прокси"
+            echo "  proxyrun -p <профиль> <команда>        Запуск через конкретный профиль"
+            echo "  proxyrun -d <команда>                  Запуск напрямую (без прокси)"
+            echo "  proxyrun (без аргументов)              Открыть интерактивное TUI-меню"
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Если вызвали без аргументов — открываем TUI
+if [ $# -eq 0 ] && [ -z "$SELECTED_PROFILE" ]; then
+    tui_menu
+    exit 0
+fi
+
+# Находим URL прокси
+if [ -z "$SELECTED_PROFILE" ]; then
+    SELECTED_PROFILE=$(get_default_id)
+fi
+
+TARGET_URL=$(get_profile_url "$SELECTED_PROFILE")
+
+if [ -z "$TARGET_URL" ]; then
+    echo "Ошибка: Профиль '$SELECTED_PROFILE' не найден в $PROFILES_FILE" >&2
+    exit 1
+fi
+
+# Экспорт полного набора сетевых переменных
+if [ "$TARGET_URL" = "DIRECT" ]; then
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+else
+    export HTTP_PROXY="$TARGET_URL"
+    export HTTPS_PROXY="$TARGET_URL"
+    export http_proxy="$TARGET_URL"
+    export https_proxy="$TARGET_URL"
+    export ALL_PROXY="$TARGET_URL"
+    export all_proxy="$TARGET_URL"
+    export NO_PROXY="localhost,127.0.0.1,::1"
+    export no_proxy="localhost,127.0.0.1,::1"
+fi
+
+exec "$@"
