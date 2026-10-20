@@ -468,8 +468,23 @@ else
     export no_proxy="localhost,127.0.0.1,::1"
 fi
 
-export BUN_TMPDIR="$HOME/.cache/opencode-tmp"
-export TMPDIR="$HOME/.cache/opencode-tmp"
-mkdir -p "$HOME/.cache/opencode-tmp"
+# Изолированный RAM-каталог (0 износа флешки, очищается при перезагрузке)
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+RAM_TMP="$RUNTIME_BASE/opencode-tmp"
+
+mkdir -p "$RAM_TMP" 2>/dev/null || true
+
+# Проверка доступности RAM на запись
+if touch "$RAM_TMP/.probe" 2>/dev/null; then
+    rm -f "$RAM_TMP/.probe"
+    export BUN_TMPDIR="$RAM_TMP"
+    export TMPDIR="$RAM_TMP"
+else
+    # Фоллбэк на диск только при аппаратном сбое RAM
+    FALLBACK_TMP="$HOME/.cache/opencode-tmp"
+    mkdir -p "$FALLBACK_TMP" 2>/dev/null || true
+    export BUN_TMPDIR="$FALLBACK_TMP"
+    export TMPDIR="$FALLBACK_TMP"
+fi
 
 exec "$@"
