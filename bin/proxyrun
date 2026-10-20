@@ -468,4 +468,8 @@ else
     export no_proxy="localhost,127.0.0.1,::1"
 fi
 
+export BUN_TMPDIR="$HOME/.cache/opencode-tmp"
+export TMPDIR="$HOME/.cache/opencode-tmp"
+mkdir -p "$HOME/.cache/opencode-tmp"
+
 exec "$@"
